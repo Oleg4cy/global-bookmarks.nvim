@@ -1,6 +1,6 @@
 local M = {}
 
-local function open_selection(prompt_bufnr, target_win, actions, action_state)
+local function open_selection(prompt_bufnr, target_win, actions, action_state, reveal)
   local selection = action_state.get_selected_entry()
 
   actions.close(prompt_bufnr)
@@ -18,6 +18,9 @@ local function open_selection(prompt_bufnr, target_win, actions, action_state)
 
     vim.api.nvim_set_current_win(target_win)
     vim.cmd("edit " .. vim.fn.fnameescape(path))
+    if reveal then
+      require("global-bookmarks.integrations.nvim-tree").reveal_current_file()
+    end
   end)
 end
 
@@ -28,7 +31,10 @@ local function delete_bookmark(prompt_bufnr, bookmarks, actions, action_state)
     return
   end
 
-  bookmarks.toggle(selection[1])
+  local action = bookmarks.toggle(selection[1])
+  if action ~= nil then
+    require("global-bookmarks.integrations.nvim-tree").refresh()
+  end
   actions.close(prompt_bufnr)
   vim.schedule(M.open)
 end
@@ -60,16 +66,16 @@ function M.open()
     previewer = conf.file_previewer({}),
     attach_mappings = function(prompt_bufnr, map)
       map("i", "<CR>", function()
-        open_selection(prompt_bufnr, target_win, actions, action_state)
+        open_selection(prompt_bufnr, target_win, actions, action_state, true)
       end)
       map("n", "<CR>", function()
-        open_selection(prompt_bufnr, target_win, actions, action_state)
+        open_selection(prompt_bufnr, target_win, actions, action_state, true)
       end)
       map("i", "<C-o>", function()
-        open_selection(prompt_bufnr, target_win, actions, action_state)
+        open_selection(prompt_bufnr, target_win, actions, action_state, false)
       end)
       map("n", "<C-o>", function()
-        open_selection(prompt_bufnr, target_win, actions, action_state)
+        open_selection(prompt_bufnr, target_win, actions, action_state, false)
       end)
       map("i", "<C-d>", function()
         delete_bookmark(prompt_bufnr, bookmarks, actions, action_state)
