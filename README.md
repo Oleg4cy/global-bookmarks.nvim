@@ -115,11 +115,21 @@ The tests use plain Neovim/Lua and fake Telescope, NvimTree, and filesystem inte
 
 ## Healthcheck
 
-Run:
+`:checkhealth global-bookmarks` works once `global-bookmarks.nvim` is loaded and present in `runtimepath`.
+
+With a lazy-loaded installation in a fresh Neovim session, load the plugin first:
+
+```vim
+:lua require("global-bookmarks")
+:checkhealth global-bookmarks
+```
+
+After a global-bookmarks feature has already been used in the current Neovim session, the direct command is sufficient:
 
 ```vim
 :checkhealth global-bookmarks
 ```
+
 
 ## License
 

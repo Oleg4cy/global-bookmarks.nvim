@@ -4,6 +4,11 @@ local function test(name, fn)
 end
 
 local real_vim = vim
+local repo_root = real_vim.fn.getcwd()
+
+local function repo_file(path)
+  return repo_root .. "/" .. path
+end
 local module_names = {
   "global-bookmarks", "global-bookmarks.core",
   "global-bookmarks.integrations.telescope",
@@ -57,7 +62,7 @@ local storage_path = "/real/user/data/global-bookmarks.json"
 local function json(v) return real_vim.json.encode(v) end
 local function clear_modules() for _, n in ipairs(module_names) do package.loaded[n], package.preload[n] = nil, nil end end
 local function load_core()
-  local chunk = assert(loadfile("/home/fn/global-bookmarks.nvim/lua/global-bookmarks/core.lua")); setfenv(chunk, fake); return chunk()
+  local chunk = assert(loadfile(repo_file("lua/global-bookmarks/core.lua"))); setfenv(chunk, fake); return chunk()
 end
 local function load_with_fake_vim(path)
   local chunk = assert(loadfile(path))
@@ -73,7 +78,7 @@ end
 local function public(c)
   clear_modules()
   package.loaded["global-bookmarks.core"] = c
-  return load_with_fake_vim("/home/fn/global-bookmarks.nvim/lua/global-bookmarks/init.lua")
+  return load_with_fake_vim(repo_file("lua/global-bookmarks/init.lua"))
 end
 
 test("core lazy loading and cached missing state", function()
@@ -116,7 +121,7 @@ test("telescope is lazy and handles empty list", function() with_fake_vim(functi
   assert(lazy_module and not listed)
   for _, n in ipairs({"telescope.pickers", "telescope.finders", "telescope.config", "telescope.actions", "telescope.actions.state"}) do assert(not loaded[n]) end
   package.loaded["global-bookmarks.integrations.telescope"] = nil
-  local M = load_with_fake_vim("/home/fn/global-bookmarks.nvim/lua/global-bookmarks/integrations/telescope.lua")
+  local M = load_with_fake_vim(repo_file("lua/global-bookmarks/integrations/telescope.lua"))
   local notes, old = {}, fake.notify
   fake.notify = function(...) notes[#notes + 1] = {...} end
   listed = false
@@ -125,13 +130,13 @@ test("telescope is lazy and handles empty list", function() with_fake_vim(functi
   for _, n in ipairs({"telescope.pickers", "telescope.finders", "telescope.config", "telescope.actions", "telescope.actions.state"}) do assert(not loaded[n]) end
   fake.notify = old
 end) end)
-test("telescope picker construction and delete reopen", function() with_fake_vim(function() clear_modules(); local state = { selected = "/test/file.php" }; local loaded = telescope_deps(state); local deleted, refreshes = false, 0; package.loaded["global-bookmarks"] = { list = function() return deleted and {} or { state.selected } end, toggle = function(p) assert(p == state.selected); deleted = true; return "removed", p end }; package.preload["global-bookmarks.integrations.nvim-tree"] = function() return { refresh = function() refreshes = refreshes + 1 end } end; local notes, old = {}, fake.notify; fake.notify = function(...) notes[#notes + 1] = {...} end; local M = load_with_fake_vim("/home/fn/global-bookmarks.nvim/lua/global-bookmarks/integrations/telescope.lua"); M.open(); assert(state.opts.prompt_title == "Global Bookmarks" and state.finder[1] == state.selected and state.sorter and state.previewer and state.picker); local maps = {}; local map = function(mode, key, fn) maps[mode .. key] = fn end; assert(state.opts.attach_mappings(1, map) == true); for _, k in ipairs({"i<CR>", "n<CR>", "i<C-o>", "n<C-o>", "i<C-d>", "ndd"}) do assert(maps[k]) end; maps["i<C-d>"](); fake.wait(10); assert(refreshes == 1 and notes[#notes][1] == "No global bookmarks"); fake.notify = old end) end)
+test("telescope picker construction and delete reopen", function() with_fake_vim(function() clear_modules(); local state = { selected = "/test/file.php" }; local loaded = telescope_deps(state); local deleted, refreshes = false, 0; package.loaded["global-bookmarks"] = { list = function() return deleted and {} or { state.selected } end, toggle = function(p) assert(p == state.selected); deleted = true; return "removed", p end }; package.preload["global-bookmarks.integrations.nvim-tree"] = function() return { refresh = function() refreshes = refreshes + 1 end } end; local notes, old = {}, fake.notify; fake.notify = function(...) notes[#notes + 1] = {...} end; local M = load_with_fake_vim(repo_file("lua/global-bookmarks/integrations/telescope.lua")); M.open(); assert(state.opts.prompt_title == "Global Bookmarks" and state.finder[1] == state.selected and state.sorter and state.previewer and state.picker); local maps = {}; local map = function(mode, key, fn) maps[mode .. key] = fn end; assert(state.opts.attach_mappings(1, map) == true); for _, k in ipairs({"i<CR>", "n<CR>", "i<C-o>", "n<C-o>", "i<C-d>", "ndd"}) do assert(maps[k]) end; maps["i<C-d>"](); fake.wait(10); assert(refreshes == 1 and notes[#notes][1] == "No global bookmarks"); fake.notify = old end) end)
 test("telescope CR and C-o behavior", function() with_fake_vim(function()
   clear_modules(); local state = { selected = "/test/file.php" }; telescope_deps(state)
   package.loaded["global-bookmarks"] = { list = function() return { state.selected } end }
   local revealed = 0
   package.preload["global-bookmarks.integrations.nvim-tree"] = function() return { reveal_current_file = function() revealed = revealed + 1 end } end
-  local M = load_with_fake_vim("/home/fn/global-bookmarks.nvim/lua/global-bookmarks/integrations/telescope.lua"); local maps = {}
+  local M = load_with_fake_vim(repo_file("lua/global-bookmarks/integrations/telescope.lua")); local maps = {}
   local map = function(mode, key, fn) maps[mode .. key] = fn end
   local function run(key, should_reveal)
     M.open(); state.opts.attach_mappings(1, map); fake.last_cmd = nil; local before_reveals = revealed; state.closed = 0; maps[key](); assert(state.closed == 1 and fake.last_cmd == "edit /test/file.php" and revealed == before_reveals + (should_reveal and 1 or 0)); maps = {}
