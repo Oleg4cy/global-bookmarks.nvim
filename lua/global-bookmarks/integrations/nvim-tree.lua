@@ -12,7 +12,7 @@ function M.decorator()
     self.icon_placement = "after"
     self.icon = {
       str = " ",
-      hl = { "NvimTreeBookmarkIcon" },
+      hl = { "GlobalBookmarksNvimTreeIcon" },
     }
     self.bookmark_cache = {}
   end
@@ -42,7 +42,7 @@ function M.decorator()
 
   function GlobalBookmarkDecorator:highlight_group(node)
     if self:is_bookmarked(node) then
-      return "NvimTreeBookmarkHL"
+      return "GlobalBookmarksNvimTreeHL"
     end
 
     return nil
