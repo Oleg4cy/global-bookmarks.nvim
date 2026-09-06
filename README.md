@@ -1,12 +1,28 @@
 # global-bookmarks.nvim
 
-A small persistent global bookmark plugin for Neovim. Bookmarks are global rather than project-local, persist between Neovim sessions, and are stored as normalized absolute file paths in a JSON array at:
+Persistent global file bookmarks for Neovim. Bookmark paths are shared across projects and persisted between sessions. Operations are explicit and manual: the plugin has no background watcher, polling process, or automatic synchronization.
+
+## Features
+
+- Persistent bookmarks stored globally rather than per project.
+- Optional Telescope picker and NvimTree integration.
+- Manual add/remove, open, and delete operations.
+
+## Requirements
+
+Neovim must provide the `vim.uv`, `vim.json`, and `vim.health` APIs used by the plugin. Telescope is required only for the bookmark picker. NvimTree is required only for the tree integration, which requires an NvimTree API providing `Decorator.extend`.
+
+## Installation
+
+The repository supplies its own lazy.nvim package metadata, so the normal lazy.nvim specification is intentionally small:
 
 ```lua
-vim.fn.stdpath("data") .. "/global-bookmarks.json"
+{
+  "Oleg4cy/global-bookmarks.nvim",
+}
 ```
 
-Storage is loaded lazily on the first bookmark storage operation and remains cached in memory afterward. The plugin has no polling, timers, or background filesystem watchers. It does not provide multi-instance file locking or automatic cross-process synchronization.
+No `setup()` call is required.
 
 ## Public API
 
@@ -15,43 +31,67 @@ require("global-bookmarks").list()
 require("global-bookmarks").is_bookmarked(path)
 require("global-bookmarks").toggle(path)
 require("global-bookmarks").toggle_current_file()
+require("global-bookmarks").open()
 ```
 
-`toggle(path)` and `toggle_current_file()` return `"added", normalized_path` or `"removed", normalized_path`. For invalid or empty paths they return `nil, nil`. Toggle operations emit user notifications.
+- `list()` returns an independent, case-insensitively sorted bookmark list.
+- `is_bookmarked(path)` checks a normalized path.
+- `toggle(path)` adds or removes a bookmark. On success it returns `"added", normalized_path` or `"removed", normalized_path`; for an invalid path or persistence failure it returns `nil, nil`. A persistence failure is reported with an `ERROR` notification.
+- `toggle_current_file()` delegates to `toggle()` for the current buffer.
+- `open()` opens the Telescope bookmark picker without requiring callers to use the Telescope integration module directly.
 
-## Telescope integration
+## Commands
 
-Telescope is optional and is loaded only when the picker is opened with a non-empty bookmark list.
+- `:GlobalBookmarks` opens the bookmark picker.
+- `:GlobalBookmarkToggle` toggles the current file bookmark.
+
+## Default mappings
+
+Global normal-mode defaults are:
+
+- `<leader>m` — open Global Bookmarks (`<Plug>(GlobalBookmarksOpen)`).
+- `<leader>M` — toggle the current-file bookmark (`<Plug>(GlobalBookmarksToggleCurrent)`).
+
+### Remapping
+
+Define replacement mappings before `VimEnter`, targeting the stable `<Plug>` action:
 
 ```lua
-require("global-bookmarks.integrations.telescope").open()
+vim.keymap.set(
+  "n",
+  "<leader>b",
+  "<Plug>(GlobalBookmarksOpen)",
+  { desc = "Global Bookmarks: Open" }
+)
+
+vim.keymap.set(
+  "n",
+  "<leader>B",
+  "<Plug>(GlobalBookmarksToggleCurrent)",
+  { desc = "Global Bookmarks: Toggle current file" }
+)
 ```
 
-Picker-local mappings:
-
-- `<CR>` opens the selected file and reveals it in NvimTree.
-- `<C-o>` opens the selected file without NvimTree reveal.
-- `<C-d>` deletes the selected bookmark in insert mode.
-- `dd` deletes the selected bookmark in normal mode.
-
-The plugin does not automatically create a global keymap for opening the picker.
+If another left-hand side already maps to a stable target, the plugin does not create that action's original default. An occupied original left-hand side is never overwritten. Open and Toggle are handled independently. This is replacement semantics, not an extra alias.
 
 ## NvimTree integration
 
+Add the integration to your existing NvimTree `on_attach(bufnr)`:
+
 ```lua
-require("global-bookmarks.integrations.nvim-tree")
+local function on_attach(bufnr)
+  require("nvim-tree.api").config.mappings.default_on_attach(bufnr)
+  require("global-bookmarks.integrations.nvim-tree").attach(bufnr)
+end
 ```
 
-The integration exposes `.decorator()`, `.toggle_node()`, `.refresh()`, and `.reveal_current_file()`.
-
-Global bookmarks are independent from NvimTree's native bookmarks. This integration does not use or synchronize through `api.marks`; native NvimTree bookmarks may coexist with global bookmarks. The custom decorator reads global bookmark state directly. It uses the dedicated highlight groups `GlobalBookmarksNvimTreeIcon` and `GlobalBookmarksNvimTreeHL`.
-
-Register the decorator in the user's NvimTree configuration alongside every built-in decorator that should remain active. Specifying `renderer.decorators` replaces NvimTree's decorator list; it does not automatically merge with the defaults.
+Specifying `renderer.decorators` replaces NvimTree's decorator list; it does not automatically merge with the existing/default decorators. Preserve whichever existing NvimTree decorators you want and append `global_bookmarks_tree.decorator()` to that list. This list is illustrative:
 
 ```lua
 local global_bookmarks_tree = require("global-bookmarks.integrations.nvim-tree")
 
 require("nvim-tree").setup({
+  on_attach = on_attach,
   renderer = {
     decorators = {
       "Git",
@@ -68,68 +108,80 @@ require("nvim-tree").setup({
 })
 ```
 
-The native NvimTree bookmark is controlled by NvimTree, may use its native `m` mapping, and uses NvimTree's own bookmark state. A global bookmark is controlled by global-bookmarks.nvim, persists in `global-bookmarks.json`, and may be mapped separately, for example to `gm`. The plugin itself defines neither `m` nor `gm`.
+The plugin does not call `nvim-tree.setup()` or monkey-patch NvimTree.
 
-## Installation
+### NvimTree mappings
 
-With [Lazy.nvim](https://github.com/folke/lazy.nvim):
+These normal-mode mappings are buffer-local to NvimTree:
+
+- `gm` — toggle the Global Bookmark for the node (`<Plug>(GlobalBookmarksNvimTreeToggle)`).
+- `gb` — open the Global Bookmarks picker (`<Plug>(GlobalBookmarksNvimTreeOpen)`).
+
+They use the same replacement semantics as the global defaults: mapping another key to the stable `<Plug>` target suppresses that original default, occupied `gm` and `gb` mappings are not overwritten, and Toggle and Open are independent.
+
+### NvimTree highlights
+
+The plugin defines `GlobalBookmarksNvimTreeHL` and `GlobalBookmarksNvimTreeIcon` with `default = true`; users and colorschemes may override them.
+
+## Telescope picker
+
+Picker defaults are:
+
+| Mode | Mapping | Action |
+| --- | --- | --- |
+| Insert | `<CR>` | Open the selected bookmark and reveal it in NvimTree. |
+| Insert | `<C-o>` | Open the selected bookmark without revealing it. |
+| Insert | `<C-d>` | Delete the selected bookmark. |
+| Normal | `<CR>` | Open the selected bookmark and reveal it in NvimTree. |
+| Normal | `<C-o>` | Open the selected bookmark without revealing it. |
+| Normal | `dd` | Delete the selected bookmark. |
+
+The stable picker-local actions exist in both insert and normal modes:
+
+- `<Plug>(GlobalBookmarksTelescopeOpenReveal)`
+- `<Plug>(GlobalBookmarksTelescopeOpen)`
+- `<Plug>(GlobalBookmarksTelescopeDelete)`
+
+The plugin currently exposes the stable picker-local `<Plug>` targets, but does not provide a separate setup/keymap configuration table or a public prompt-buffer configuration hook.
+
+The picker checks mappings in its prompt buffer: if a mode already maps to a stable action, it does not install that action's default; an occupied default left-hand side is also preserved. Remapping/default suppression is mode-specific internally, so replacing Delete in insert mode does not replace normal-mode `dd`.
+
+## Storage
+
+Bookmarks are stored in:
 
 ```lua
-{
-  "Oleg4cy/global-bookmarks.nvim",
-  lazy = true,
-}
+vim.fn.stdpath("data") .. "/global-bookmarks.json"
 ```
 
-Telescope and NvimTree are optional integrations and must be available in the user's configuration when used; they are not mandatory core dependencies.
+The file contains an array of bookmark-path strings. Invalid or malformed persisted data fails closed to an empty in-memory state; reading it does not rewrite or repair the file automatically. Bookmark state changes in memory only after persistence succeeds.
 
-For example, a user may configure commands and mappings for the integrations:
+Filesystem write failures do not crash the plugin, do not falsely report a bookmark as added or removed, and leave cached state unchanged. The public API reports the failure with an `ERROR` notification.
 
-```lua
--- User configuration examples; these are not created automatically.
-vim.api.nvim_create_user_command("GlobalBookmarks", function()
-  require("global-bookmarks.integrations.telescope").open()
-end, {})
+## Healthcheck
 
-vim.api.nvim_create_user_command("GlobalBookmarkToggle", function()
-  require("global-bookmarks").toggle_current_file()
-end, {})
+Run:
 
-vim.keymap.set("n", "<leader>gb", "<cmd>GlobalBookmarks<cr>")
-vim.keymap.set("n", "gm", "<cmd>GlobalBookmarkToggle<cr>")
+```vim
+:checkhealth global-bookmarks
 ```
 
-## Performance
+The healthcheck is passive. It may validate the top-level public API, expected storage path, already-loaded Telescope, already-loaded NvimTree and its decorator API, and the API shape of already-loaded integration modules. It does not force-load Telescope, NvimTree, the Telescope integration, or the NvimTree integration. Unloaded optional lazy integrations are informational rather than failures. It does not read or write bookmark storage.
 
-Requiring the public module does not read bookmark storage. Telescope and NvimTree are not loaded merely by requiring their integration modules. The plugin uses no timers, polling, or background loops.
+If lazy.nvim has not loaded the plugin yet, load it first:
+
+```vim
+:Lazy load global-bookmarks.nvim
+:checkhealth global-bookmarks
+```
 
 ## Tests
-
-Run the standalone tests with:
 
 ```sh
 nvim --headless -u tests/minimal_init.lua -i NONE -l tests/bookmarks_spec.lua
 ```
 
-The tests use plain Neovim/Lua and fake Telescope, NvimTree, and filesystem integrations rather than requiring those third-party plugins.
-
-## Healthcheck
-
-`:checkhealth global-bookmarks` works once `global-bookmarks.nvim` is loaded and present in `runtimepath`.
-
-With a lazy-loaded installation in a fresh Neovim session, load the plugin first:
-
-```vim
-:lua require("global-bookmarks")
-:checkhealth global-bookmarks
-```
-
-After a global-bookmarks feature has already been used in the current Neovim session, the direct command is sufficient:
-
-```vim
-:checkhealth global-bookmarks
-```
-
+The standalone tests use plain Neovim/Lua with no external testing framework, and use controlled fake integrations and storage where appropriate.
 
 ## License
 
