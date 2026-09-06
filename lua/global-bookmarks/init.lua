@@ -17,7 +17,12 @@ function M.is_bookmarked(path)
 end
 
 function M.toggle(path)
-  local action, normalized_path = core.toggle(path)
+  local action, normalized_path, err = core.toggle(path)
+
+  if err then
+    notify("Failed to save bookmarks: " .. err, vim.log.levels.ERROR)
+    return nil, nil
+  end
 
   if action == nil then
     notify("Path not found", vim.log.levels.WARN)

@@ -35,10 +35,53 @@ local function read_file(path)
   return data
 end
 
+local function is_valid_state(candidate)
+  if type(candidate) ~= "table" then
+    return false
+  end
+
+  local length = 0
+  for index, bookmark_path in pairs(candidate) do
+    if type(index) ~= "number" or index < 1 or index % 1 ~= 0 then
+      return false
+    end
+
+    if type(bookmark_path) ~= "string" or bookmark_path == "" then
+      return false
+    end
+
+    length = length + 1
+  end
+
+  for index = 1, length do
+    if candidate[index] == nil then
+      return false
+    end
+  end
+
+  return true
+end
+
 local function write_file(path, data)
-  local fd = assert(uv.fs_open(path, "w", 420))
-  uv.fs_write(fd, data, 0)
+  local fd, open_err = uv.fs_open(path, "w", 420)
+  if not fd then
+    return nil, "failed to open bookmarks file: " .. tostring(open_err)
+  end
+
+  local offset = 0
+  local data_length = #data
+  while offset < data_length do
+    local written = uv.fs_write(fd, data:sub(offset + 1), offset)
+    if type(written) ~= "number" or written <= 0 then
+      uv.fs_close(fd)
+      return nil, "failed to write bookmarks file"
+    end
+
+    offset = offset + written
+  end
+
   uv.fs_close(fd)
+  return true
 end
 
 local function load()
@@ -53,7 +96,7 @@ local function load()
   end
 
   local ok, decoded = pcall(vim.json.decode, data)
-  if ok and type(decoded) == "table" then
+  if ok and is_valid_state(decoded) then
     state = decoded
   else
     state = {}
@@ -62,8 +105,8 @@ local function load()
   return state
 end
 
-local function save()
-  write_file(bookmarks_file, vim.json.encode(load()))
+local function save(candidate)
+  return write_file(bookmarks_file, vim.json.encode(candidate))
 end
 
 local function sort_paths(paths)
@@ -101,14 +144,26 @@ function M.toggle(path)
   local bookmarks = load()
   for index, bookmarked_path in ipairs(bookmarks) do
     if bookmarked_path == normalized_path then
-      table.remove(bookmarks, index)
-      save()
+      local candidate = vim.deepcopy(bookmarks)
+      table.remove(candidate, index)
+      local ok, err = save(candidate)
+      if not ok then
+        return nil, nil, err
+      end
+
+      state = candidate
       return "removed", normalized_path
     end
   end
 
-  table.insert(bookmarks, normalized_path)
-  save()
+  local candidate = vim.deepcopy(bookmarks)
+  table.insert(candidate, normalized_path)
+  local ok, err = save(candidate)
+  if not ok then
+    return nil, nil, err
+  end
+
+  state = candidate
   return "added", normalized_path
 end
 
