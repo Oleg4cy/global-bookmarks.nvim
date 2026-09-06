@@ -162,6 +162,155 @@ test("nvim-tree lazy loading refresh toggle reveal and decorator contract", func
   local D = M.decorator(); local one = D(); assert(one.enabled and one.highlight_range == "all" and one.icon_placement == "after"); local icons = one:icons(node); assert(icons[1].str == " " and icons[1].hl[1] == "GlobalBookmarksNvimTreeIcon" and one:highlight_group(node) == "GlobalBookmarksNvimTreeHL"); local before = lookups; one:icons(node); one:highlight_group(node); assert(lookups == before); local unmarked = { absolute_path = "/none" }; local before_unmarked = lookups; assert(one:icons(unmarked) == nil); assert(lookups == before_unmarked + 1); assert(one:highlight_group(unmarked) == nil and one:icons(unmarked) == nil and lookups == before_unmarked + 1); local before_invalid = lookups; assert(one:icons(nil) == nil and one:highlight_group({ absolute_path = "" }) == nil and lookups == before_invalid); local before_second = lookups; local two = D(); two:icons(node); assert(lookups == before_second + 1)
 end) end)
 
+local function isolated_nvim_tree_test(fn)
+  local loaded, preload = {}, {}
+  for _, n in ipairs(module_names) do
+    loaded[n], preload[n] = package.loaded[n], package.preload[n]
+  end
+  local old_vim, old_api, old_fn, old_keymap = _G.vim, fake.api, fake.fn, fake.keymap
+  clear_modules()
+  _G.vim = fake
+  local ok, err = xpcall(fn, debug.traceback)
+  _G.vim, fake.api, fake.fn, fake.keymap = old_vim, old_api, old_fn, old_keymap
+  for _, n in ipairs(module_names) do
+    package.loaded[n], package.preload[n] = loaded[n], preload[n]
+  end
+  if not ok then error(err, 0) end
+end
+
+test("nvim-tree attach, mappings, highlights, and cache invalidation are standalone", function()
+  isolated_nvim_tree_test(function()
+    local maps, highlights, valid_checks, buf_calls, hasmapto_calls, maparg_calls = {}, {}, {}, {}, 0, 0
+    local active_buffer, api_loads, lookups, reloads, visible = nil, 0, 0, 0, false
+    local remapped, occupied = {}, {}
+    local tree_api
+    tree_api = {
+      tree = {
+        is_visible = function() return visible end,
+        reload = function() reloads = reloads + 1 end,
+        find_file = function(opts) tree_api.find_opts = opts end,
+      },
+      Decorator = {},
+    }
+    function tree_api.Decorator:extend()
+      local parent, class = self, {}
+      class.__index = class
+      setmetatable(class, { __index = parent, __call = function(cls, ...)
+        local instance = setmetatable({}, cls)
+        if instance.new then instance:new(...) end
+        return instance
+      end })
+      return class
+    end
+    fake.api = {
+      nvim_buf_is_valid = function(bufnr) valid_checks[#valid_checks + 1] = bufnr; return bufnr == 42 end,
+      nvim_buf_call = function(bufnr, callback)
+        buf_calls[#buf_calls + 1] = bufnr
+        local previous = active_buffer; active_buffer = bufnr; callback(); active_buffer = previous
+      end,
+      nvim_set_hl = function(namespace, name, opts)
+        highlights[#highlights + 1] = { namespace = namespace, name = name, opts = opts }
+      end,
+    }
+    fake.keymap = { set = function(mode, lhs, rhs, opts)
+      maps[#maps + 1] = { mode = mode, lhs = lhs, rhs = rhs, opts = opts }
+    end }
+    fake.fn = {
+      hasmapto = function(target, mode)
+        hasmapto_calls = hasmapto_calls + 1
+        assert(active_buffer == 42 and mode == "n")
+        return remapped[target] or 0
+      end,
+      maparg = function(lhs, mode)
+        maparg_calls = maparg_calls + 1
+        assert(active_buffer == 42 and mode == "n")
+        return occupied[lhs] or ""
+      end,
+    }
+    package.preload["nvim-tree.api"] = function() api_loads = api_loads + 1; return tree_api end
+    package.loaded["global-bookmarks"] = {
+      is_bookmarked = function(path) lookups = lookups + 1; return path == "/marked" end,
+    }
+
+    local M = load_with_fake_vim(repo_file("lua/global-bookmarks/integrations/nvim-tree.lua"))
+    assert(api_loads == 0)
+    local before_valid, before_calls, before_maps = #valid_checks, #buf_calls, #maps
+    assert(M.attach(nil) == false)
+    assert(#valid_checks == before_valid and #buf_calls == before_calls and #maps == before_maps)
+    for _, value in ipairs({ false, "1", {} }) do
+      before_valid, before_calls, before_maps = #valid_checks, #buf_calls, #maps
+      assert(M.attach(value) == false)
+      assert(#valid_checks == before_valid and #buf_calls == before_calls and #maps == before_maps)
+    end
+    assert(M.attach(99) == false and valid_checks[#valid_checks] == 99 and #maps == 0)
+
+    assert(M.attach(42) == true and api_loads == 0)
+    assert(#buf_calls == 1 and buf_calls[1] == 42)
+    local by_lhs = {}
+    for _, map in ipairs(maps) do by_lhs[map.lhs] = map end
+    local function assert_map(lhs, rhs, desc)
+      local map = assert(by_lhs[lhs])
+      assert(map.mode == "n" and map.rhs == rhs)
+      assert(map.opts.buffer == 42 and map.opts.silent == true and map.opts.nowait == true and map.opts.desc == desc)
+    end
+    assert_map("<Plug>(GlobalBookmarksNvimTreeToggle)", M.toggle_node, "nvim-tree: Toggle Global Bookmark")
+    assert_map("<Plug>(GlobalBookmarksNvimTreeOpen)", "<Cmd>GlobalBookmarks<CR>", "nvim-tree: Open Global Bookmarks")
+    assert_map("gm", "<Plug>(GlobalBookmarksNvimTreeToggle)", "nvim-tree: Toggle Global Bookmark")
+    assert_map("gb", "<Plug>(GlobalBookmarksNvimTreeOpen)", "nvim-tree: Open Global Bookmarks")
+
+    local function attach_with(remap, existing)
+      maps, remapped, occupied = {}, remap, existing
+      hasmapto_calls, maparg_calls = 0, 0
+      assert(M.attach(42) == true)
+      local result = {}; for _, map in ipairs(maps) do result[map.lhs] = map end
+      assert(result["<Plug>(GlobalBookmarksNvimTreeToggle)"] and result["<Plug>(GlobalBookmarksNvimTreeOpen)"])
+      return result
+    end
+    local result = attach_with({ ["<Plug>(GlobalBookmarksNvimTreeToggle)"] = 1 }, {})
+    assert(result.gm == nil and result.gb and hasmapto_calls == 2 and maparg_calls == 1)
+    result = attach_with({ ["<Plug>(GlobalBookmarksNvimTreeOpen)"] = 1 }, {})
+    assert(result.gm and result.gb == nil and hasmapto_calls == 2 and maparg_calls == 1)
+    result = attach_with({}, { gm = "existing-gm" })
+    assert(result.gm == nil and result.gb)
+    result = attach_with({}, { gb = "existing-gb" })
+    assert(result.gm and result.gb == nil)
+
+    local D = M.decorator()
+    assert(#highlights == 2)
+    local expected_highlights = { GlobalBookmarksNvimTreeHL = true, GlobalBookmarksNvimTreeIcon = true }
+    for _, highlight in ipairs(highlights) do
+      assert(expected_highlights[highlight.name] and highlight.namespace == 0)
+      local opts, count = highlight.opts, 0; for _ in pairs(opts) do count = count + 1 end
+      assert(count == 3 and opts.fg == "#fb4934" and opts.bold == true and opts.default == true)
+    end
+    local recorded_highlights = {}
+    for _, highlight in ipairs(highlights) do recorded_highlights[highlight.name] = true end
+    assert(recorded_highlights.GlobalBookmarksNvimTreeHL and recorded_highlights.GlobalBookmarksNvimTreeIcon)
+    assert(not recorded_highlights.NvimTreeBookmarkHL and not recorded_highlights.NvimTreeBookmarkIcon)
+    local decorator, marked, unmarked = D(), { absolute_path = "/marked" }, { absolute_path = "/unmarked" }
+    assert(decorator.enabled == true and decorator.highlight_range == "all" and decorator.icon_placement == "after")
+    assert(decorator:icons(marked)[1].str == " " and decorator:icons(marked)[1].hl[1] == "GlobalBookmarksNvimTreeIcon")
+    assert(decorator:highlight_group(marked) == "GlobalBookmarksNvimTreeHL" and lookups == 1)
+    assert(decorator:icons(unmarked) == nil and decorator:highlight_group(unmarked) == nil and lookups == 2)
+    assert(decorator:icons(unmarked) == nil and lookups == 2)
+    local before_invalid = lookups
+    assert(decorator:icons(nil) == nil and decorator:highlight_group({}) == nil and decorator:icons({ absolute_path = "" }) == nil and lookups == before_invalid)
+
+    package.loaded["nvim-tree.api"] = nil
+    assert(M.refresh() == false and api_loads == 1)
+    decorator:icons(marked); assert(lookups == 3)
+    package.loaded["nvim-tree.api"] = tree_api
+    visible = false; assert(M.refresh() == false and reloads == 0)
+    decorator:icons(marked); assert(lookups == 4)
+    visible = true; assert(M.refresh() == true and reloads == 1)
+    decorator:icons(marked); assert(lookups == 5)
+
+    assert(M.reveal_current_file() == true)
+    local find_opts, count = tree_api.find_opts, 0; for _ in pairs(find_opts) do count = count + 1 end
+    assert(count == 3 and find_opts.open == true and find_opts.focus == false and find_opts.update_root == true)
+  end)
+end)
+
 local function isolated_plugin_test(fn)
   local loaded, preload = {}, {}
   for _, n in ipairs(module_names) do
