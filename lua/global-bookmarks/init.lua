@@ -39,4 +39,8 @@ function M.toggle_current_file()
   return M.toggle(path)
 end
 
+function M.open()
+  return require("global-bookmarks.integrations.telescope").open()
+end
+
 return M
