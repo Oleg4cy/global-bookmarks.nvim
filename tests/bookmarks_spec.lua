@@ -162,5 +162,222 @@ test("nvim-tree lazy loading refresh toggle reveal and decorator contract", func
   local D = M.decorator(); local one = D(); assert(one.enabled and one.highlight_range == "all" and one.icon_placement == "after"); local icons = one:icons(node); assert(icons[1].str == " " and icons[1].hl[1] == "GlobalBookmarksNvimTreeIcon" and one:highlight_group(node) == "GlobalBookmarksNvimTreeHL"); local before = lookups; one:icons(node); one:highlight_group(node); assert(lookups == before); local unmarked = { absolute_path = "/none" }; local before_unmarked = lookups; assert(one:icons(unmarked) == nil); assert(lookups == before_unmarked + 1); assert(one:highlight_group(unmarked) == nil and one:icons(unmarked) == nil and lookups == before_unmarked + 1); local before_invalid = lookups; assert(one:icons(nil) == nil and one:highlight_group({ absolute_path = "" }) == nil and lookups == before_invalid); local before_second = lookups; local two = D(); two:icons(node); assert(lookups == before_second + 1)
 end) end)
 
+local function isolated_plugin_test(fn)
+  local loaded, preload = {}, {}
+  for _, n in ipairs(module_names) do
+    loaded[n], preload[n] = package.loaded[n], package.preload[n]
+  end
+  local old_g, old_api, old_fn, old_keymap = fake.g, fake.api, fake.fn, fake.keymap
+  clear_modules()
+  for _, n in ipairs(module_names) do
+    local name = n
+    package.preload[name] = function() error("Unexpected require: " .. name) end
+  end
+  local ok, err = xpcall(fn, debug.traceback)
+  fake.g, fake.api, fake.fn, fake.keymap = old_g, old_api, old_fn, old_keymap
+  for _, n in ipairs(module_names) do
+    package.loaded[n], package.preload[n] = loaded[n], preload[n]
+  end
+  if not ok then error(err, 0) end
+end
+
+test("public open lazily delegates and returns the integration result", function()
+  isolated_plugin_test(function()
+    local loads, calls, sentinel = 0, 0, {}
+    local integration = { open = function() calls = calls + 1; return sentinel end }
+    package.loaded["global-bookmarks.core"] = {}
+    package.preload["global-bookmarks"] = function()
+      return load_with_fake_vim(repo_file("lua/global-bookmarks/init.lua"))
+    end
+    package.preload["global-bookmarks.integrations.telescope"] = function()
+      loads = loads + 1
+      return integration
+    end
+    local M = require("global-bookmarks")
+    assert(type(M.open) == "function" and loads == 0 and calls == 0)
+    assert(package.loaded["global-bookmarks.integrations.telescope"] == nil)
+    assert(require("global-bookmarks").open() == sentinel)
+    assert(loads == 1 and calls == 1)
+    assert(package.loaded["global-bookmarks.integrations.telescope"] == integration)
+  end)
+end)
+
+local function plugin_commands()
+  local commands, registrations = {}, 0
+  fake.g = {}
+  fake.api = { nvim_create_user_command = function(name, callback, opts)
+    registrations = registrations + 1
+    assert(commands[name] == nil)
+    assert(type(callback) == "function" and type(opts) == "table")
+    commands[name] = callback
+  end }
+  assert(fake.g.loaded_global_bookmarks == nil)
+  load_with_fake_vim(repo_file("plugin/global-bookmarks.lua"))
+  assert(fake.g.loaded_global_bookmarks == true and registrations == 2)
+  assert(commands.GlobalBookmarks and commands.GlobalBookmarkToggle)
+  return commands, function() return registrations end
+end
+
+test("real plugin registers exactly two commands and respects its loaded guard", function()
+  isolated_plugin_test(function()
+    local commands, count = plugin_commands()
+    load_with_fake_vim(repo_file("plugin/global-bookmarks.lua"))
+    assert(count() == 2)
+    local names = 0
+    for name in pairs(commands) do
+      assert(name == "GlobalBookmarks" or name == "GlobalBookmarkToggle")
+      names = names + 1
+    end
+    assert(names == 2)
+    fake.g.loaded_global_bookmarks = nil
+  end)
+end)
+
+test("GlobalBookmarks command uses only the public open API", function()
+  isolated_plugin_test(function()
+    local commands = plugin_commands()
+    local calls = 0
+    package.loaded["global-bookmarks"] = { open = function() calls = calls + 1 end }
+    commands.GlobalBookmarks()
+    assert(calls == 1)
+    assert(package.loaded["global-bookmarks.integrations.telescope"] == nil)
+  end)
+end)
+
+test("GlobalBookmarkToggle refreshes only after a successful public toggle", function()
+  isolated_plugin_test(function()
+    local commands = plugin_commands()
+    local calls, loads, refreshes, returned = 0, 0, 0, false
+    package.loaded["global-bookmarks"] = { toggle_current_file = function()
+      calls = calls + 1
+      assert(loads == 0 and refreshes == 0)
+      assert(package.loaded["global-bookmarks.integrations.nvim-tree"] == nil)
+      returned = true
+      return "added", "/test/current.php"
+    end }
+    package.preload["global-bookmarks.integrations.nvim-tree"] = function()
+      assert(returned and calls == 1)
+      loads = loads + 1
+      return { refresh = function() refreshes = refreshes + 1 end }
+    end
+    commands.GlobalBookmarkToggle()
+    assert(calls == 1 and loads == 1 and refreshes == 1)
+  end)
+end)
+
+test("GlobalBookmarkToggle does not load or refresh an integration without an action", function()
+  isolated_plugin_test(function()
+    local commands = plugin_commands()
+    local calls, loads, refreshes = 0, 0, 0
+    package.loaded["global-bookmarks"] = { toggle_current_file = function()
+      calls = calls + 1
+      return nil, nil
+    end }
+    package.preload["global-bookmarks.integrations.nvim-tree"] = function()
+      loads = loads + 1
+      return { refresh = function() refreshes = refreshes + 1 end }
+    end
+    commands.GlobalBookmarkToggle()
+    assert(calls == 1 and loads == 0 and refreshes == 0)
+    assert(package.loaded["global-bookmarks.integrations.nvim-tree"] == nil)
+  end)
+end)
+
+local function lazy_scenario(remapped, occupied, expect_open, expect_toggle)
+  isolated_plugin_test(function()
+    local maps, autocmds, hasmapto_calls, maparg_calls = {}, {}, {}, {}
+    fake.keymap = { set = function(mode, lhs, rhs, opts)
+      maps[#maps + 1] = { mode = mode, lhs = lhs, rhs = rhs, opts = opts }
+    end }
+    fake.api = { nvim_create_autocmd = function(event, opts)
+      autocmds[#autocmds + 1] = { event = event, opts = opts }
+    end }
+    fake.fn = {
+      hasmapto = function(...)
+        local args = { ... }; hasmapto_calls[#hasmapto_calls + 1] = args
+        return remapped[args[1]] or 0
+      end,
+      maparg = function(...)
+        local args = { ... }; maparg_calls[#maparg_calls + 1] = args
+        return occupied[args[1]] or ""
+      end,
+    }
+    local package_specs = load_with_fake_vim(repo_file("lazy.lua"))
+    assert(type(package_specs) == "table" and #package_specs == 1)
+    for key in pairs(package_specs) do assert(key == 1) end
+    local spec = package_specs[1]
+    assert(type(spec) == "table" and spec[1] == "Oleg4cy/global-bookmarks.nvim")
+    assert(type(spec.cmd) == "table" and #spec.cmd == 2)
+    for key in pairs(spec.cmd) do assert(key == 1 or key == 2) end
+    assert(spec.cmd[1] == "GlobalBookmarks" and spec.cmd[2] == "GlobalBookmarkToggle")
+    assert(type(spec.init) == "function")
+    spec.init()
+    local function assert_mapping(mapping, lhs, rhs, desc)
+      assert(mapping and mapping.mode == "n" and mapping.lhs == lhs and mapping.rhs == rhs)
+      assert(mapping.opts.silent == true and mapping.opts.desc == desc)
+    end
+    assert(#maps == 2)
+    assert_mapping(maps[1], "<Plug>(GlobalBookmarksOpen)", "<Cmd>GlobalBookmarks<CR>", "Global Bookmarks: Open")
+    assert_mapping(maps[2], "<Plug>(GlobalBookmarksToggleCurrent)", "<Cmd>GlobalBookmarkToggle<CR>", "Global Bookmarks: Toggle current file")
+    assert(#hasmapto_calls == 0 and #maparg_calls == 0)
+    assert(#autocmds == 1 and autocmds[1].event == "VimEnter")
+    assert(autocmds[1].opts.once == true and type(autocmds[1].opts.callback) == "function")
+    local function assert_unloaded()
+      for _, name in ipairs({ "global-bookmarks", "global-bookmarks.core", "global-bookmarks.integrations.telescope", "global-bookmarks.integrations.nvim-tree" }) do
+        assert(package.loaded[name] == nil)
+      end
+    end
+    assert_unloaded()
+    autocmds[1].opts.callback()
+    assert_unloaded()
+    local defaults = {}
+    for i = 3, #maps do
+      local mapping = maps[i]
+      assert(defaults[mapping.lhs] == nil)
+      defaults[mapping.lhs] = mapping
+    end
+    assert(#maps == 2 + (expect_open and 1 or 0) + (expect_toggle and 1 or 0))
+    if expect_open then
+      assert_mapping(defaults["<leader>m"], "<leader>m", "<Plug>(GlobalBookmarksOpen)", "Global Bookmarks: Open")
+    else
+      assert(defaults["<leader>m"] == nil)
+    end
+    if expect_toggle then
+      assert_mapping(defaults["<leader>M"], "<leader>M", "<Plug>(GlobalBookmarksToggleCurrent)", "Global Bookmarks: Toggle current file")
+    else
+      assert(defaults["<leader>M"] == nil)
+    end
+    assert(#hasmapto_calls == 2)
+    local targets = { "<Plug>(GlobalBookmarksOpen)", "<Plug>(GlobalBookmarksToggleCurrent)" }
+    local lhs_values, maparg_index = { "<leader>m", "<leader>M" }, 0
+    for i, target in ipairs(targets) do
+      local args = hasmapto_calls[i]
+      assert(#args == 2 and args[1] == target and args[2] == "n")
+      if (remapped[target] or 0) == 0 then
+        maparg_index = maparg_index + 1
+        args = maparg_calls[maparg_index]
+        assert(args and #args == 2 and args[1] == lhs_values[i] and args[2] == "n")
+      end
+    end
+    assert(#maparg_calls == maparg_index)
+  end)
+end
+
+test("lazy spec installs stable actions and defers free defaults to VimEnter", function()
+  lazy_scenario({}, {}, true, true)
+end)
+test("lazy Open remapping suppresses only the Open default", function()
+  lazy_scenario({ ["<Plug>(GlobalBookmarksOpen)"] = 1 }, {}, false, true)
+end)
+test("lazy Toggle remapping suppresses only the Toggle default", function()
+  lazy_scenario({ ["<Plug>(GlobalBookmarksToggleCurrent)"] = 1 }, {}, true, false)
+end)
+test("lazy occupied Open lhs preserves the independent Toggle default", function()
+  lazy_scenario({}, { ["<leader>m"] = "existing-open" }, false, true)
+end)
+test("lazy occupied Toggle lhs preserves the independent Open default", function()
+  lazy_scenario({}, { ["<leader>M"] = "existing-toggle" }, true, false)
+end)
+
 for _, n in ipairs(module_names) do package.loaded[n], package.preload[n] = saved_loaded[n], saved_preload[n] end
 print("global-bookmarks tests: OK")
