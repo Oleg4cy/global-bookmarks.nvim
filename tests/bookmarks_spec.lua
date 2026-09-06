@@ -51,6 +51,7 @@ fake.vim = fake; setmetatable(fake, { __index = _G })
 fake.fn = { stdpath = function() return "/real/user/data" end, fnamemodify = function(p) return "/fallback/" .. p:gsub("^/", "") end, fnameescape = function(p) return p end }
 fake.json, fake.uv, fake.loop = real_vim.json, uv, uv
 fake.deepcopy = real_vim.deepcopy
+fake.tbl_extend = real_vim.tbl_extend
 fake.schedule, fake.wait = function(fn) fn() end, function() return true end
 fake.notify, fake.log = function() end, { levels = { INFO = 1, WARN = 2 } }
 fake.cmd = function(command)
@@ -109,7 +110,7 @@ test("public current file delegates exact buffer name", function() with_fake_vim
 
 local function telescope_deps(state)
   local loaded = {}; local function provide(n, v) package.preload[n] = function() loaded[n] = true; return v end end
-  provide("telescope.pickers", { new = function(_, o) state.opts = o; return { find = function(self) state.picker = self end } end }); provide("telescope.finders", { new_table = function(o) state.finder = o.results; return o end }); provide("telescope.config", { values = { generic_sorter = function() state.sorter = true; return "sorter" end, file_previewer = function() state.previewer = true; return "previewer" end } }); provide("telescope.actions", { close = function() state.closed = (state.closed or 0) + 1 end }); provide("telescope.actions.state", { get_selected_entry = function() return { state.selected } end }); return loaded
+  provide("telescope.pickers", { new = function(_, o) state.opts = o; return { find = function(self) state.picker = self end } end }); provide("telescope.finders", { new_table = function(o) state.finder = o.results; return o end }); provide("telescope.config", { values = { generic_sorter = function() state.sorter = true; return "sorter" end, file_previewer = function() state.previewer = true; return "previewer" end } }); provide("telescope.actions", { close = function(prompt_bufnr) state.closed = (state.closed or 0) + 1; state.closed_prompt = prompt_bufnr end }); provide("telescope.actions.state", { get_selected_entry = function() return state.selection end }); return loaded
 end
 test("telescope is lazy and handles empty list", function() with_fake_vim(function()
   clear_modules()
@@ -130,19 +131,147 @@ test("telescope is lazy and handles empty list", function() with_fake_vim(functi
   for _, n in ipairs({"telescope.pickers", "telescope.finders", "telescope.config", "telescope.actions", "telescope.actions.state"}) do assert(not loaded[n]) end
   fake.notify = old
 end) end)
-test("telescope picker construction and delete reopen", function() with_fake_vim(function() clear_modules(); local state = { selected = "/test/file.php" }; local loaded = telescope_deps(state); local deleted, refreshes = false, 0; package.loaded["global-bookmarks"] = { list = function() return deleted and {} or { state.selected } end, toggle = function(p) assert(p == state.selected); deleted = true; return "removed", p end }; package.preload["global-bookmarks.integrations.nvim-tree"] = function() return { refresh = function() refreshes = refreshes + 1 end } end; local notes, old = {}, fake.notify; fake.notify = function(...) notes[#notes + 1] = {...} end; local M = load_with_fake_vim(repo_file("lua/global-bookmarks/integrations/telescope.lua")); M.open(); assert(state.opts.prompt_title == "Global Bookmarks" and state.finder[1] == state.selected and state.sorter and state.previewer and state.picker); local maps = {}; local map = function(mode, key, fn) maps[mode .. key] = fn end; assert(state.opts.attach_mappings(1, map) == true); for _, k in ipairs({"i<CR>", "n<CR>", "i<C-o>", "n<C-o>", "i<C-d>", "ndd"}) do assert(maps[k]) end; maps["i<C-d>"](); fake.wait(10); assert(refreshes == 1 and notes[#notes][1] == "No global bookmarks"); fake.notify = old end) end)
-test("telescope CR and C-o behavior", function() with_fake_vim(function()
-  clear_modules(); local state = { selected = "/test/file.php" }; telescope_deps(state)
-  package.loaded["global-bookmarks"] = { list = function() return { state.selected } end }
-  local revealed = 0
-  package.preload["global-bookmarks.integrations.nvim-tree"] = function() return { reveal_current_file = function() revealed = revealed + 1 end } end
-  local M = load_with_fake_vim(repo_file("lua/global-bookmarks/integrations/telescope.lua")); local maps = {}
-  local map = function(mode, key, fn) maps[mode .. key] = fn end
-  local function run(key, should_reveal)
-    M.open(); state.opts.attach_mappings(1, map); fake.last_cmd = nil; local before_reveals = revealed; state.closed = 0; maps[key](); assert(state.closed == 1 and fake.last_cmd == "edit /test/file.php" and revealed == before_reveals + (should_reveal and 1 or 0)); maps = {}
+local function isolated_telescope_test(fn)
+  local loaded, preload = {}, {}
+  for _, n in ipairs(module_names) do loaded[n], preload[n] = package.loaded[n], package.preload[n] end
+  local old_api, old_fn, old_cmd, old_schedule, old_notify = fake.api, fake.fn, fake.cmd, fake.schedule, fake.notify
+  clear_modules()
+  local ok, err = xpcall(fn, debug.traceback)
+  fake.api, fake.fn, fake.cmd, fake.schedule, fake.notify = old_api, old_fn, old_cmd, old_schedule, old_notify
+  for _, n in ipairs(module_names) do package.loaded[n], package.preload[n] = loaded[n], preload[n] end
+  if not ok then error(err, 0) end
+end
+
+local function telescope_scenario(remapped, occupied)
+  local state, maps, checks = { selected = "/test/file.php", selection = { "/test/file.php" } }, {}, { hasmapto = {}, maparg = {}, buf_calls = {} }
+  local active_buffer, edits, scheduled, refreshes, reveals, toggles, target_wins, list_calls = nil, {}, 0, 0, 0, {}, {}, 0
+  telescope_deps(state)
+  fake.api = {
+    nvim_get_current_win = function() return 7 end,
+    nvim_win_is_valid = function(win) return win == 7 end,
+    nvim_set_current_win = function(win) assert(win == 7); target_wins[#target_wins + 1] = win end,
+    nvim_buf_call = function(bufnr, callback)
+      checks.buf_calls[#checks.buf_calls + 1] = bufnr
+      local previous = active_buffer; active_buffer = bufnr
+      local result = callback(); active_buffer = previous
+      return result
+    end,
+  }
+  fake.fn = {
+    fnameescape = function(path) return path end,
+    hasmapto = function(plug, mode)
+      assert(active_buffer == 42)
+      checks.hasmapto[#checks.hasmapto + 1] = { plug, mode }
+      return remapped[mode .. plug] or 0
+    end,
+    maparg = function(lhs, mode)
+      assert(active_buffer == 42)
+      checks.maparg[#checks.maparg + 1] = { lhs, mode }
+      return occupied[mode .. lhs] or ""
+    end,
+  }
+  fake.cmd = function(command) edits[#edits + 1] = command end
+  fake.schedule = function(callback) scheduled = scheduled + 1; callback() end
+  package.loaded["global-bookmarks"] = {
+    list = function() list_calls = list_calls + 1; return { state.selected } end,
+    toggle = function(path) toggles[#toggles + 1] = path; return state.toggle_action, path end,
+  }
+  package.preload["global-bookmarks.integrations.nvim-tree"] = function()
+    return { refresh = function() refreshes = refreshes + 1 end, reveal_current_file = function() reveals = reveals + 1 end }
   end
-  run("i<CR>", true); run("n<CR>", true); run("i<C-o>", false); run("n<C-o>", false)
+  local M = load_with_fake_vim(repo_file("lua/global-bookmarks/integrations/telescope.lua"))
+  M.open()
+  assert(state.opts.prompt_title == "Global Bookmarks" and state.finder[1] == state.selected and state.sorter and state.previewer and state.picker)
+  assert(state.opts.attach_mappings(42, function(mode, lhs, rhs, opts)
+    maps[#maps + 1] = { mode = mode, lhs = lhs, rhs = rhs, opts = opts }
+  end) == true)
+  local function mapping(mode, lhs)
+    for _, map in ipairs(maps) do if map.mode == mode and map.lhs == lhs then return map end end
+  end
+  return { state = state, maps = maps, checks = checks, mapping = mapping, edits = edits, scheduled = function() return scheduled end, refreshes = function() return refreshes end, reveals = function() return reveals end, toggles = toggles, target_wins = target_wins, list_calls = function() return list_calls end }
+end
+
+local telescope_plugs = {
+  { "<Plug>(GlobalBookmarksTelescopeOpenReveal)", "Global Bookmarks: Open and reveal" },
+  { "<Plug>(GlobalBookmarksTelescopeOpen)", "Global Bookmarks: Open" },
+  { "<Plug>(GlobalBookmarksTelescopeDelete)", "Global Bookmarks: Delete" },
+}
+
+test("telescope picker stable actions and defaults use Telescope mappings", function() isolated_telescope_test(function()
+  local s = telescope_scenario({}, {})
+  assert(#s.maps == 12 and #s.checks.buf_calls == 6 and #s.checks.hasmapto == 6 and #s.checks.maparg == 6)
+  for _, plug in ipairs(telescope_plugs) do
+    for _, mode in ipairs({ "i", "n" }) do
+      local map = assert(s.mapping(mode, plug[1]))
+      assert(type(map.rhs) == "function" and map.opts.silent == true and map.opts.desc == plug[2])
+    end
+  end
+  local defaults = { { "i", "<CR>", telescope_plugs[1] }, { "i", "<C-o>", telescope_plugs[2] }, { "i", "<C-d>", telescope_plugs[3] }, { "n", "<CR>", telescope_plugs[1] }, { "n", "<C-o>", telescope_plugs[2] }, { "n", "dd", telescope_plugs[3] } }
+  for _, default in ipairs(defaults) do
+    local map = assert(s.mapping(default[1], default[2]))
+    assert(type(map.rhs) == "table" and map.rhs[1] == default[3][1] and map.rhs.type == "command")
+    assert(map.opts.silent == true and map.opts.remap == true and map.opts.desc == default[3][2])
+  end
+  local checks = {}
+  for _, check in ipairs(s.checks.hasmapto) do checks[check[2] .. check[1]] = true end
+  for _, default in ipairs(defaults) do assert(checks[default[1] .. default[3][1]]) end
+  checks = {}
+  for _, check in ipairs(s.checks.maparg) do checks[check[2] .. check[1]] = true end
+  for _, default in ipairs(defaults) do assert(checks[default[1] .. default[2]]) end
 end) end)
+
+test("telescope stable OpenReveal Open and Delete callbacks preserve behavior", function() isolated_telescope_test(function()
+  local s = telescope_scenario({}, {})
+  local reveal = assert(s.mapping("i", telescope_plugs[1][1])); reveal.rhs()
+  assert(s.state.closed == 1 and s.state.closed_prompt == 42 and s.scheduled() == 1 and s.edits[1] == "edit /test/file.php" and s.target_wins[1] == 7 and s.reveals() == 1)
+  local open = assert(s.mapping("n", telescope_plugs[2][1])); open.rhs()
+  assert(s.state.closed == 2 and s.scheduled() == 2 and s.edits[2] == "edit /test/file.php" and s.target_wins[2] == 7 and s.reveals() == 1)
+  s.state.toggle_action = "removed"
+  local delete = assert(s.mapping("i", telescope_plugs[3][1])); delete.rhs()
+  assert(s.toggles[1] == "/test/file.php" and s.refreshes() == 1 and s.state.closed == 3 and s.scheduled() == 3 and s.list_calls() == 2)
+  s.state.selection = nil
+  reveal.rhs(); open.rhs(); delete.rhs()
+  assert(#s.edits == 2 and #s.toggles == 1 and s.state.closed == 5 and s.refreshes() == 1)
+  s.state.selection = {}
+  reveal.rhs(); open.rhs(); delete.rhs()
+  assert(#s.edits == 2 and #s.toggles == 1 and s.state.closed == 7 and s.refreshes() == 1)
+end) end)
+
+local function telescope_suppression_case(remapped, occupied, absent, present)
+  isolated_telescope_test(function()
+    local s = telescope_scenario(remapped, occupied)
+    for _, entry in ipairs(absent) do assert(s.mapping(entry[1], entry[2]) == nil) end
+    for _, entry in ipairs(present) do assert(s.mapping(entry[1], entry[2])) end
+    for _, plug in ipairs(telescope_plugs) do
+      assert(s.mapping("i", plug[1]) and s.mapping("n", plug[1]))
+    end
+    for _, entry in ipairs({ { "i", "<CR>" }, { "i", "<C-o>" }, { "i", "<C-d>" }, { "n", "<CR>" }, { "n", "<C-o>" }, { "n", "dd" } }) do
+      local suppressed = false
+      for _, missing in ipairs(absent) do suppressed = suppressed or (missing[1] == entry[1] and missing[2] == entry[2]) end
+      if not suppressed then assert(s.mapping(entry[1], entry[2])) end
+    end
+  end)
+end
+
+test("telescope remaps suppress only their matching mode defaults", function()
+  local reveal, open, delete = telescope_plugs[1][1], telescope_plugs[2][1], telescope_plugs[3][1]
+  telescope_suppression_case({ ["i" .. reveal] = 1 }, {}, { { "i", "<CR>" } }, { { "i", reveal }, { "i", "<C-o>" }, { "i", "<C-d>" }, { "n", "<CR>" } })
+  telescope_suppression_case({ ["n" .. reveal] = 1 }, {}, { { "n", "<CR>" } }, { { "n", reveal }, { "i", "<CR>" } })
+  telescope_suppression_case({ ["i" .. open] = 1 }, {}, { { "i", "<C-o>" } }, { { "i", "<CR>" }, { "i", "<C-d>" }, { "n", "<C-o>" } })
+  telescope_suppression_case({ ["n" .. open] = 1 }, {}, { { "n", "<C-o>" } }, { { "n", "<CR>" }, { "n", "dd" }, { "i", "<C-o>" } })
+  telescope_suppression_case({ ["i" .. delete] = 1 }, {}, { { "i", "<C-d>" } }, { { "i", "<CR>" }, { "n", "dd" } })
+  telescope_suppression_case({ ["n" .. delete] = 1 }, {}, { { "n", "dd" } }, { { "n", "<CR>" }, { "i", "<C-d>" } })
+end)
+
+test("telescope occupied defaults are protected independently", function()
+  for _, case in ipairs({
+    { "i", "<CR>", { "n", "<CR>" } }, { "n", "<CR>", { "i", "<CR>" } },
+    { "i", "<C-o>", { "n", "<C-o>" } }, { "n", "<C-o>", { "i", "<C-o>" } },
+    { "i", "<C-d>", { "n", "dd" } }, { "n", "dd", { "i", "<C-d>" } },
+  }) do
+    telescope_suppression_case({}, { [case[1] .. case[2]] = "user mapping" }, { { case[1], case[2] } }, { case[3] })
+  end
+end)
 
 test("nvim-tree lazy loading refresh toggle reveal and decorator contract", function() with_fake_vim(function()
   local api
