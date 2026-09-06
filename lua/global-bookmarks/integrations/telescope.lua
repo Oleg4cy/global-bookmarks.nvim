@@ -39,6 +39,12 @@ local function delete_bookmark(prompt_bufnr, bookmarks, actions, action_state)
   vim.schedule(M.open)
 end
 
+local function should_install_default(prompt_bufnr, mode, lhs, plug)
+  return vim.api.nvim_buf_call(prompt_bufnr, function()
+    return vim.fn.hasmapto(plug, mode) == 0 and vim.fn.maparg(lhs, mode) == ""
+  end)
+end
+
 function M.open()
   local bookmarks = require("global-bookmarks")
   local items = bookmarks.list()
@@ -65,24 +71,66 @@ function M.open()
     sorter = conf.generic_sorter({}),
     previewer = conf.file_previewer({}),
     attach_mappings = function(prompt_bufnr, map)
-      map("i", "<CR>", function()
+      local open_reveal = "<Plug>(GlobalBookmarksTelescopeOpenReveal)"
+      local open = "<Plug>(GlobalBookmarksTelescopeOpen)"
+      local delete = "<Plug>(GlobalBookmarksTelescopeDelete)"
+      local mapping_options = {
+        silent = true,
+      }
+
+      map("i", open_reveal, function()
         open_selection(prompt_bufnr, target_win, actions, action_state, true)
-      end)
-      map("n", "<CR>", function()
+      end, vim.tbl_extend("force", mapping_options, {
+        desc = "Global Bookmarks: Open and reveal",
+      }))
+      map("n", open_reveal, function()
         open_selection(prompt_bufnr, target_win, actions, action_state, true)
-      end)
-      map("i", "<C-o>", function()
+      end, vim.tbl_extend("force", mapping_options, {
+        desc = "Global Bookmarks: Open and reveal",
+      }))
+      map("i", open, function()
         open_selection(prompt_bufnr, target_win, actions, action_state, false)
-      end)
-      map("n", "<C-o>", function()
+      end, vim.tbl_extend("force", mapping_options, {
+        desc = "Global Bookmarks: Open",
+      }))
+      map("n", open, function()
         open_selection(prompt_bufnr, target_win, actions, action_state, false)
-      end)
-      map("i", "<C-d>", function()
+      end, vim.tbl_extend("force", mapping_options, {
+        desc = "Global Bookmarks: Open",
+      }))
+      map("i", delete, function()
         delete_bookmark(prompt_bufnr, bookmarks, actions, action_state)
-      end)
-      map("n", "dd", function()
+      end, vim.tbl_extend("force", mapping_options, {
+        desc = "Global Bookmarks: Delete",
+      }))
+      map("n", delete, function()
         delete_bookmark(prompt_bufnr, bookmarks, actions, action_state)
-      end)
+      end, vim.tbl_extend("force", mapping_options, {
+        desc = "Global Bookmarks: Delete",
+      }))
+
+      local defaults = {
+        { "i", "<CR>", open_reveal, "Global Bookmarks: Open and reveal" },
+        { "i", "<C-o>", open, "Global Bookmarks: Open" },
+        { "i", "<C-d>", delete, "Global Bookmarks: Delete" },
+        { "n", "<CR>", open_reveal, "Global Bookmarks: Open and reveal" },
+        { "n", "<C-o>", open, "Global Bookmarks: Open" },
+        { "n", "dd", delete, "Global Bookmarks: Delete" },
+      }
+
+      for _, default in ipairs(defaults) do
+        local mode, lhs, plug, desc = unpack(default)
+        if should_install_default(prompt_bufnr, mode, lhs, plug) then
+          map(mode, lhs, {
+            plug,
+            type = "command",
+          }, {
+            desc = desc,
+            remap = true,
+            silent = true,
+          })
+        end
+      end
 
       return true
     end,
