@@ -751,5 +751,168 @@ test("lazy occupied Toggle lhs preserves the independent Open default", function
   lazy_scenario({}, { ["<leader>M"] = "existing-toggle" }, true, false)
 end)
 
+local health_module_names = {
+  "global-bookmarks",
+  "telescope",
+  "nvim-tree.api",
+  "global-bookmarks.integrations.telescope",
+  "global-bookmarks.integrations.nvim-tree",
+}
+
+local function health_has(calls, kind, message)
+  for _, call in ipairs(calls) do
+    if call.kind == kind and call.message == message then return true end
+  end
+  return false
+end
+
+local function health_count(calls, kind)
+  local count = 0
+  for _, call in ipairs(calls) do if call.kind == kind then count = count + 1 end end
+  return count
+end
+
+local function health_run(configure)
+  local loaded, preload = {}, {}
+  for _, name in ipairs(health_module_names) do
+    loaded[name], preload[name] = package.loaded[name], package.preload[name]
+    package.loaded[name], package.preload[name] = nil, nil
+  end
+  local old_health, old_fn, old_uv, old_loop = fake.health, fake.fn, fake.uv, fake.loop
+  local old_api, old_keymap = fake.api, fake.keymap
+  local calls = {}
+  local observed = {}
+  local function record(kind)
+    return function(message) calls[#calls + 1] = { kind = kind, message = message } end
+  end
+  local function forbidden(name)
+    return function() error("healthcheck must not call " .. name) end
+  end
+  fake.health = { start = record("start"), ok = record("ok"), info = record("info"), error = record("error"), warn = forbidden("vim.health.warn") }
+  fake.fn = { stdpath = function(name) assert(name == "data"); return "/home/test/.local/share/nvim" end }
+  fake.uv = { fs_open = forbidden("vim.uv.fs_open"), fs_read = forbidden("vim.uv.fs_read"), fs_write = forbidden("vim.uv.fs_write"), fs_realpath = forbidden("vim.uv.fs_realpath") }
+  fake.loop = fake.uv
+  fake.api = { nvim_create_user_command = forbidden("vim.api.nvim_create_user_command"), nvim_create_autocmd = forbidden("vim.api.nvim_create_autocmd") }
+  fake.keymap = { set = forbidden("vim.keymap.set") }
+  local ok, err = xpcall(function()
+    configure(package.loaded, package.preload)
+    local health = load_with_fake_vim(repo_file("lua/global-bookmarks/health.lua"))
+    assert(type(health) == "table" and type(health.check) == "function")
+    health.check()
+    for _, name in ipairs(health_module_names) do observed[name] = package.loaded[name] end
+  end, debug.traceback)
+  fake.health, fake.fn, fake.uv, fake.loop = old_health, old_fn, old_uv, old_loop
+  fake.api, fake.keymap = old_api, old_keymap
+  for _, name in ipairs(health_module_names) do package.loaded[name], package.preload[name] = loaded[name], preload[name] end
+  if not ok then error(err, 0) end
+  return calls, observed
+end
+
+local function passive_public_api()
+  local api = {}
+  for _, name in ipairs({ "list", "is_bookmarked", "toggle", "toggle_current_file", "open" }) do
+    api[name] = function() error("healthcheck must not execute public API: " .. name) end
+  end
+  return api
+end
+
+test("healthcheck validates the passive public API and reports its sections", function()
+  local calls = health_run(function(loaded)
+    loaded["global-bookmarks"] = passive_public_api()
+  end)
+  for _, name in ipairs({ "list", "is_bookmarked", "toggle", "toggle_current_file", "open" }) do
+    assert(health_has(calls, "ok", "public API: " .. name))
+  end
+  assert(health_has(calls, "info", "expected storage path: /home/test/.local/share/nvim/global-bookmarks.json"))
+  assert(health_has(calls, "start", "global-bookmarks.nvim"))
+  assert(health_has(calls, "start", "Telescope integration"))
+  assert(health_has(calls, "start", "NvimTree integration"))
+  assert(health_has(calls, "start", "Integration modules"))
+  assert(health_has(calls, "info", "standalone tests: nvim --headless -u tests/minimal_init.lua -i NONE -l tests/bookmarks_spec.lua"))
+end)
+
+test("healthcheck handles a failed top-level require without checking members", function()
+  local calls = health_run(function(_, preload)
+    preload["global-bookmarks"] = function() error("controlled require failure") end
+  end)
+  assert(health_count(calls, "error") == 1)
+  assert(calls[1].kind == "start" and calls[1].message == "global-bookmarks.nvim")
+  assert(calls[2].kind == "error" and calls[2].message:find("failed to require global-bookmarks:", 1, true))
+  for _, call in ipairs(calls) do assert(not call.message:find("public API:", 1, true)) end
+end)
+
+test("healthcheck reports malformed public API members without invoking them", function()
+  for _, malformed in ipairs({ { name = "open", value = nil }, { name = "toggle", value = "bad" } }) do
+    local calls = health_run(function(loaded)
+      local api = passive_public_api(); api[malformed.name] = malformed.value; loaded["global-bookmarks"] = api
+    end)
+    assert(health_has(calls, "error", "public API member is missing or invalid: " .. malformed.name))
+    for _, name in ipairs({ "list", "is_bookmarked", "toggle", "toggle_current_file", "open" }) do
+      if name ~= malformed.name then assert(health_has(calls, "ok", "public API: " .. name)) end
+    end
+  end
+end)
+
+test("healthcheck keeps optional dependencies unloaded and informational", function()
+  local calls, observed = health_run(function(loaded, preload)
+    loaded["global-bookmarks"] = passive_public_api()
+    for _, name in ipairs({ "telescope", "nvim-tree.api", "global-bookmarks.integrations.telescope", "global-bookmarks.integrations.nvim-tree" }) do
+      preload[name] = function() error("healthcheck must not require " .. name) end
+    end
+  end)
+  assert(health_has(calls, "info", "Telescope is not currently loaded and was not force-loaded by the healthcheck"))
+  assert(health_has(calls, "info", "NvimTree API is not currently loaded and was not force-loaded by the healthcheck"))
+  assert(health_has(calls, "info", "global-bookmarks.integrations.telescope is not currently loaded and was not force-loaded by the healthcheck"))
+  assert(health_has(calls, "info", "global-bookmarks.integrations.nvim-tree is not currently loaded and was not force-loaded by the healthcheck"))
+  assert(health_count(calls, "error") == 0)
+  for _, name in ipairs({ "telescope", "nvim-tree.api", "global-bookmarks.integrations.telescope", "global-bookmarks.integrations.nvim-tree" }) do
+    assert(observed[name] == nil)
+  end
+end)
+
+test("healthcheck recognizes loaded passive dependency APIs", function()
+  local calls = health_run(function(loaded, preload)
+    loaded["global-bookmarks"] = passive_public_api()
+    loaded["telescope"] = {}
+    loaded["nvim-tree.api"] = { Decorator = { extend = function() error("healthcheck must not call Decorator.extend") end } }
+    loaded["global-bookmarks.integrations.telescope"] = { open = function() error("healthcheck must not call integration open") end }
+    loaded["global-bookmarks.integrations.nvim-tree"] = {
+      attach = function() error("healthcheck must not call integration attach") end,
+      decorator = function() error("healthcheck must not call integration decorator") end,
+      refresh = function() error("healthcheck must not call integration refresh") end,
+      toggle_node = function() error("healthcheck must not call integration toggle_node") end,
+      reveal_current_file = function() error("healthcheck must not call integration reveal_current_file") end,
+    }
+    preload["telescope"] = function() error("healthcheck must not require telescope") end
+  end)
+  assert(health_has(calls, "ok", "Telescope is loaded"))
+  assert(health_has(calls, "ok", "NvimTree API is loaded"))
+  assert(health_has(calls, "ok", "NvimTree decorator API is available"))
+  assert(health_has(calls, "ok", "global-bookmarks.integrations.telescope API is available"))
+  assert(health_has(calls, "ok", "global-bookmarks.integrations.nvim-tree API is available"))
+end)
+
+test("healthcheck reports malformed loaded NvimTree and integration APIs", function()
+  local cases = {
+    function(loaded) loaded["nvim-tree.api"] = { Decorator = nil } end,
+    function(loaded) loaded["nvim-tree.api"] = { Decorator = {} } end,
+    function(loaded) loaded["global-bookmarks.integrations.telescope"] = "bad" end,
+    function(loaded) loaded["global-bookmarks.integrations.telescope"] = {} end,
+    function(loaded) loaded["global-bookmarks.integrations.nvim-tree"] = "bad" end,
+    function(loaded) loaded["global-bookmarks.integrations.nvim-tree"] = { attach = function() end, decorator = function() end, refresh = function() end, toggle_node = function() end } end,
+    function(loaded) loaded["global-bookmarks.integrations.nvim-tree"] = { attach = function() end, decorator = function() end, refresh = function() end, toggle_node = "bad", reveal_current_file = function() end } end,
+  }
+  for _, setup in ipairs(cases) do
+    local calls = health_run(function(loaded)
+      loaded["global-bookmarks"] = passive_public_api()
+      setup(loaded)
+    end)
+    local expected = "this NvimTree version does not provide the decorator API required by the integration"
+    if not health_has(calls, "error", expected) then
+      assert(health_has(calls, "error", "global-bookmarks.integrations.telescope has an invalid API") or health_has(calls, "error", "global-bookmarks.integrations.nvim-tree has an invalid API"))
+    end
+  end
+end)
+
 for _, n in ipairs(module_names) do package.loaded[n], package.preload[n] = saved_loaded[n], saved_preload[n] end
 print("global-bookmarks tests: OK")
