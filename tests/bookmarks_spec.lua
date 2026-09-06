@@ -22,19 +22,25 @@ for _, name in ipairs(module_names) do
 end
 
 local files, realpaths, descriptors = {}, {}, {}
-local counters = { successful_opens = 0, closes = 0, read_attempts = 0 }
-local next_fd, fstat_fails = 0, false
+local counters = { successful_opens = 0, closes = 0, read_attempts = 0, write_attempts = 0 }
+local next_fd, fstat_fails, open_hook, write_hook, open_records, write_records = 0, false, nil, nil, {}, {}
 local fake = {}
 
 local function reset_io()
   files, realpaths, descriptors = {}, {}, {}
-  counters.successful_opens, counters.closes, counters.read_attempts = 0, 0, 0
-  next_fd, fstat_fails = 0, false
+  counters.successful_opens, counters.closes, counters.read_attempts, counters.write_attempts = 0, 0, 0, 0
+  next_fd, fstat_fails, open_hook, write_hook, open_records, write_records = 0, false, nil, nil, {}, {}
 end
 
-local function fs_open(path, flags)
+local function fs_open(path, flags, mode)
+  open_records[#open_records + 1] = { path = path, flags = flags, mode = mode }
   if flags == "r" then counters.read_attempts = counters.read_attempts + 1 end
   if flags == "r" and files[path] == nil then return nil end
+  if open_hook then
+    local fd, err, handled = open_hook(path, flags, mode)
+    if handled then return fd, err end
+  end
+  if flags == "w" then files[path] = "" end
   next_fd = next_fd + 1; descriptors[next_fd] = { path = path, flags = flags }
   counters.successful_opens = counters.successful_opens + 1; return next_fd
 end
@@ -42,7 +48,19 @@ local uv = {
   fs_open = fs_open,
   fs_close = function(fd) if descriptors[fd] then descriptors[fd] = nil; counters.closes = counters.closes + 1 end end,
   fs_read = function(fd, size, offset) local d = descriptors[fd]; return d and files[d.path]:sub(offset + 1, offset + size) end,
-  fs_write = function(fd, data) local d = descriptors[fd]; files[d.path] = data; return #data end,
+  fs_write = function(fd, data, offset)
+    counters.write_attempts = counters.write_attempts + 1
+    write_records[#write_records + 1] = { fd = fd, data = data, offset = offset }
+    local d = descriptors[fd]
+    if not d then return nil, "bad fd" end
+    local written, err = #data
+    if write_hook then written, err = write_hook(fd, data, offset) end
+    if type(written) == "number" and written > 0 then
+      local old, chunk = files[d.path] or "", data:sub(1, written)
+      files[d.path] = old:sub(1, offset) .. chunk .. old:sub(offset + written + 1)
+    end
+    return written, err
+  end,
   fs_fstat = function(fd) if fstat_fails then return nil end; local d = descriptors[fd]; return d and { size = #(files[d.path] or "") } end,
   fs_realpath = function(path) return realpaths[path] end,
 }
@@ -53,7 +71,7 @@ fake.json, fake.uv, fake.loop = real_vim.json, uv, uv
 fake.deepcopy = real_vim.deepcopy
 fake.tbl_extend = real_vim.tbl_extend
 fake.schedule, fake.wait = function(fn) fn() end, function() return true end
-fake.notify, fake.log = function() end, { levels = { INFO = 1, WARN = 2 } }
+fake.notify, fake.log = function() end, { levels = { INFO = 1, WARN = 2, ERROR = 3 } }
 fake.cmd = function(command)
   fake.last_cmd = command
 end
@@ -89,7 +107,71 @@ test("core fstat failure closes opened descriptor", function()
   reset_io(); files[storage_path] = json({ "/x" }); fstat_fails = true; local c = load_core(); assert(#c.list() == 0 and counters.successful_opens == 1 and counters.closes == 1)
 end)
 test("core invalid JSON is not rewritten", function()
-  reset_io(); files[storage_path] = "malformed"; local c = load_core(); assert(#c.list() == 0 and files[storage_path] == "malformed"); assert(counters.successful_opens == counters.closes)
+  reset_io(); files[storage_path] = "malformed"; local c = load_core(); assert(#c.list() == 0 and files[storage_path] == "malformed" and counters.write_attempts == 0); assert(counters.successful_opens == counters.closes)
+end)
+test("core accepts valid decoded bookmark arrays", function()
+  reset_io(); files[storage_path] = json({}); local c = load_core(); assert(#c.list() == 0 and c.is_bookmarked("/project/a.php") == false)
+  reset_io(); realpaths["/project/a.php"], realpaths["/project/b.php"] = "/project/a.php", "/project/b.php"; files[storage_path] = json({ "/project/a.php", "/project/b.php" }); c = load_core(); assert(c.is_bookmarked("/project/a.php") and c.is_bookmarked("/project/b.php") and #c.list() == 2)
+end)
+test("core rejects structurally invalid decoded bookmark states without repair", function()
+  local cases = {
+    { path = "/project/a.php" }, { [1] = "/project/a.php", [3] = "/project/c.php" },
+    { [0] = "/project/a.php", [1] = "/project/b.php" }, { [-1] = "/project/a.php", [1] = "/project/b.php" },
+    { [1.5] = "/project/a.php" }, { 123 }, { true }, { { "/project/a.php" } }, { "" },
+  }
+  if real_vim.NIL ~= nil then cases[#cases + 1] = { real_vim.NIL } end
+  local old_json = fake.json
+  fake.json = { encode = real_vim.json.encode, decode = function() return nil end }
+  for _, decoded in ipairs(cases) do
+    reset_io(); realpaths["/project/a.php"] = "/project/a.php"; files[storage_path] = "decoded-by-controlled-fake"
+    fake.json.decode = function() return decoded end
+    local c = load_core()
+    assert(#c.list() == 0 and c.is_bookmarked("/project/a.php") == false and files[storage_path] == "decoded-by-controlled-fake")
+    assert(counters.write_attempts == 0)
+    for _, open in ipairs(open_records) do assert(open.flags ~= "w") end
+  end
+  fake.json = old_json
+end)
+test("core failed write open preserves cached state and descriptor hygiene", function()
+  reset_io(); realpaths["/project/existing.php"] = "/project/existing.php"; files[storage_path] = json({ "/project/existing.php" }); local c = load_core(); assert(c.is_bookmarked("/project/existing.php"))
+  local closes = counters.closes
+  open_hook = function(path, flags, mode)
+    if flags == "w" then assert(path == storage_path and mode == 420); return nil, "controlled open failure", true end
+  end
+  local action, path, err = c.toggle("/project/existing.php")
+  assert(action == nil and path == nil and err == "failed to open bookmarks file: controlled open failure")
+  assert(counters.write_attempts == 0 and counters.closes == closes and c.is_bookmarked("/project/existing.php") and #c.list() == 1)
+end)
+test("core failed writes preserve add and remove cache state", function()
+  reset_io(); realpaths["/project/new.php"] = "/project/new.php"; local c = load_core(); write_hook = function() return nil, "controlled write failure" end
+  local action, path, err = c.toggle("/project/new.php")
+  assert(action == nil and path == nil and err == "failed to write bookmarks file" and not c.is_bookmarked("/project/new.php") and #c.list() == 0)
+  assert(counters.closes == 1 and counters.write_attempts == 1)
+  write_hook = nil; action, path = c.toggle("/project/new.php"); assert(action == "added" and path == "/project/new.php" and c.is_bookmarked("/project/new.php"))
+  reset_io(); realpaths["/project/existing.php"] = "/project/existing.php"; files[storage_path] = json({ "/project/existing.php" }); c = load_core(); assert(c.is_bookmarked("/project/existing.php")); local closes = counters.closes
+  write_hook = function() return nil, "controlled write failure" end; action, path, err = c.toggle("/project/existing.php")
+  assert(action == nil and path == nil and err == "failed to write bookmarks file" and c.is_bookmarked("/project/existing.php"))
+  assert(counters.closes == closes + 1); write_hook = nil; action, path = c.toggle("/project/existing.php"); assert(action == "removed" and path == "/project/existing.php" and not c.is_bookmarked("/project/existing.php"))
+end)
+test("core zero-byte write fails once and closes its descriptor", function()
+  reset_io(); realpaths["/project/new.php"] = "/project/new.php"; local c = load_core(); write_hook = function() return 0 end
+  local action, path, err = c.toggle("/project/new.php")
+  assert(action == nil and path == nil and err == "failed to write bookmarks file" and counters.write_attempts == 1 and counters.closes == 1 and not c.is_bookmarked("/project/new.php"))
+end)
+test("core completes partial writes before changing cached state", function()
+  reset_io(); realpaths["/project/new.php"] = "/project/new.php"; local c, observed_old_state = load_core(), false
+  write_hook = function(_, data)
+    if #write_records == 1 then observed_old_state = not c.is_bookmarked("/project/new.php"); return #data - 1 end
+    return #data
+  end
+  local action, path = c.toggle("/project/new.php")
+  local payload, first = write_records[1].data, write_records[1]
+  assert(action == "added" and path == "/project/new.php" and observed_old_state and c.is_bookmarked("/project/new.php"))
+  assert(#write_records == 2 and first.offset == 0 and write_records[2].offset == #payload - 1 and write_records[2].data == payload:sub(#payload))
+  assert(counters.closes == 1 and files[storage_path] == payload)
+  local write_open
+  for _, open in ipairs(open_records) do if open.flags == "w" then write_open = open end end
+  assert(write_open and write_open.path == storage_path and write_open.mode == 420)
 end)
 test("core sorting and independent copies", function()
   reset_io(); files[storage_path] = json({ "/Z", "/a", "/B", "/c" }); local c = load_core(); local first = c.list(); assert(first[1] == "/a" and first[2] == "/B" and first[3] == "/c" and first[4] == "/Z"); first[1] = "/mutated"; assert(c.list()[1] == "/a")
@@ -104,6 +186,18 @@ end)
 test("public API delegates and isolates notifications", function()
   with_fake_vim(function()
     local calls, notes, result = {}, {}, {}; local c = { list = function() calls.list = true; return result end, is_bookmarked = function(p) calls.path = p; return "result" end, toggle = function(p) calls.toggle = p; return calls.action, p end }; local old = fake.notify; fake.notify = function(...) notes[#notes + 1] = {...} end; local M = public(c); assert(M.list() == result and calls.list); assert(M.is_bookmarked("exact") == "result" and calls.path == "exact"); local a, p = M.toggle(); assert(a == nil and p == nil and notes[#notes][1] == "Path not found" and notes[#notes][2] == fake.log.levels.WARN and notes[#notes][3].title == "global-bookmarks"); calls.action = "added"; a, p = M.toggle("/test/file.php"); assert(a == "added" and p == "/test/file.php" and notes[#notes][1] == "Added bookmark: /test/file.php" and notes[#notes][2] == fake.log.levels.INFO and notes[#notes][3].title == "global-bookmarks"); calls.action = "removed"; a, p = M.toggle("/test/file.php"); assert(a == "removed" and notes[#notes][1] == "Removed bookmark: /test/file.php" and notes[#notes][2] == fake.log.levels.INFO); fake.notify = old
+  end)
+end)
+test("public API reports storage errors without exposing them", function()
+  with_fake_vim(function()
+    local notes, old = {}, fake.notify
+    fake.notify = function(...) notes[#notes + 1] = { ... } end
+    local M = public({ list = function() return {} end, is_bookmarked = function() return false end, toggle = function() return nil, nil, "controlled storage error" end })
+    local action, path, third = M.toggle("/test/file.php")
+    assert(action == nil and path == nil and third == nil and #notes == 1)
+    assert(notes[1][1]:find("controlled storage error", 1, true) and notes[1][2] == fake.log.levels.ERROR and notes[1][3].title == "global-bookmarks")
+    assert(not notes[1][1]:find("Path not found", 1, true) and not notes[1][1]:find("Added bookmark:", 1, true) and not notes[1][1]:find("Removed bookmark:", 1, true))
+    fake.notify = old
   end)
 end)
 test("public current file delegates exact buffer name", function() with_fake_vim(function() local got; local M = public({ list = function() return {} end, is_bookmarked = function() return false end, toggle = function(p) got = p; return "added", p end }); M.toggle_current_file(); assert(got == "/test/current.php") end) end)
