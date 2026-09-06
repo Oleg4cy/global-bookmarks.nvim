@@ -19,6 +19,7 @@ function M.check()
     "is_bookmarked",
     "toggle",
     "toggle_current_file",
+    "open",
   }
 
   for _, name in ipairs(public_functions) do
@@ -32,19 +33,18 @@ function M.check()
   vim.health.info("expected storage path: " .. vim.fn.stdpath("data") .. "/global-bookmarks.json")
 
   vim.health.start("Telescope integration")
-  local telescope_ok, telescope = pcall(require, "telescope")
-  if telescope_ok then
-    vim.health.ok("Telescope is available")
+  if package.loaded["telescope"] ~= nil then
+    vim.health.ok("Telescope is loaded")
   else
-    vim.health.warn("Telescope is unavailable; Telescope integration is optional and the core plugin works without it")
+    vim.health.info("Telescope is not currently loaded and was not force-loaded by the healthcheck")
   end
 
   vim.health.start("NvimTree integration")
-  local nvim_tree_ok, api = pcall(require, "nvim-tree.api")
-  if not nvim_tree_ok then
-    vim.health.warn("NvimTree is unavailable; NvimTree integration is optional and the core plugin works without it")
+  local api = package.loaded["nvim-tree.api"]
+  if api == nil then
+    vim.health.info("NvimTree API is not currently loaded and was not force-loaded by the healthcheck")
   else
-    vim.health.ok("NvimTree API is available")
+    vim.health.ok("NvimTree API is loaded")
     if type(api.Decorator) == "table" and type(api.Decorator.extend) == "function" then
       vim.health.ok("NvimTree decorator API is available")
     else
@@ -53,15 +53,37 @@ function M.check()
   end
 
   vim.health.start("Integration modules")
-  for _, module_name in ipairs({
-    "global-bookmarks.integrations.telescope",
-    "global-bookmarks.integrations.nvim-tree",
-  }) do
-    local module_ok, module_or_error = pcall(require, module_name)
-    if module_ok then
-      vim.health.ok(module_name .. " loaded")
+  local integration_modules = {
+    ["global-bookmarks.integrations.telescope"] = { "open" },
+    ["global-bookmarks.integrations.nvim-tree"] = {
+      "attach",
+      "decorator",
+      "refresh",
+      "toggle_node",
+      "reveal_current_file",
+    },
+  }
+
+  for module_name, functions in pairs(integration_modules) do
+    local module = package.loaded[module_name]
+    if module == nil then
+      vim.health.info(module_name .. " is not currently loaded and was not force-loaded by the healthcheck")
+    elseif type(module) ~= "table" then
+      vim.health.error(module_name .. " has an invalid API")
     else
-      vim.health.error(module_name .. " failed to load: " .. tostring(module_or_error))
+      local valid = true
+      for _, name in ipairs(functions) do
+        if type(module[name]) ~= "function" then
+          valid = false
+          break
+        end
+      end
+
+      if valid then
+        vim.health.ok(module_name .. " API is available")
+      else
+        vim.health.error(module_name .. " has an invalid API")
+      end
     end
   end
 
